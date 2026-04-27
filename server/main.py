@@ -120,6 +120,140 @@ class CreatePurchaseOrderRequest(BaseModel):
     expected_delivery_date: str
     notes: Optional[str] = None
 
+class RestockingRecommendation(BaseModel):
+    id: str
+    sku: str
+    name: str
+    category: str
+    warehouse: str
+    quantity_on_hand: int
+    reorder_point: int
+    recommended_qty: int
+    unit_cost: float
+    estimated_cost: float
+    score: float
+    priority: str
+    trend: Optional[str] = None
+    forecasted_demand: Optional[int] = None
+    current_demand: Optional[int] = None
+
+class RestockingResponse(BaseModel):
+    recommendations: List[RestockingRecommendation]
+    total_estimated_cost: float
+    budget_remaining: float
+    items_addressed: int
+
+def calculate_restocking(budget: float, warehouse: Optional[str] = None, category: Optional[str] = None) -> RestockingResponse:
+    """Demand-weighted restocking recommendations within a given budget."""
+    filtered = apply_filters(inventory_items, warehouse, category)
+
+    # Build a lookup from SKU to demand forecast
+    forecast_by_sku = {f["item_sku"]: f for f in demand_forecasts}
+
+    trend_modifier = {"increasing": 1.5, "stable": 1.0, "decreasing": 0.5}
+
+    candidates = []
+    for item in filtered:
+        qty = item["quantity_on_hand"]
+        reorder = item["reorder_point"]
+        cost = item["unit_cost"]
+
+        urgency = max(0.0, (reorder - qty) / reorder) if reorder > 0 else 0.0
+
+        forecast = forecast_by_sku.get(item["sku"])
+        if forecast:
+            cur = forecast["current_demand"]
+            fcast = forecast["forecasted_demand"]
+            trend = forecast["trend"]
+            demand_growth = max(0.0, (fcast - cur) / max(cur, 1))
+            modifier = trend_modifier.get(trend, 1.0)
+        else:
+            demand_growth = 0.0
+            modifier = 1.0
+            trend = None
+            fcast = None
+            cur = None
+
+        score = (urgency * 0.7 + demand_growth * 0.3) * modifier
+
+        if score == 0.0:
+            continue
+
+        if forecast:
+            target = max(reorder * 1.5, float(fcast))
+        else:
+            target = reorder * 2.0
+        recommended_qty = max(0, int(target - qty))
+
+        if recommended_qty == 0:
+            continue
+
+        candidates.append({
+            "item": item,
+            "score": score,
+            "recommended_qty": recommended_qty,
+            "trend": trend,
+            "forecasted_demand": fcast,
+            "current_demand": cur,
+        })
+
+    if not candidates:
+        return RestockingResponse(
+            recommendations=[],
+            total_estimated_cost=0.0,
+            budget_remaining=budget,
+            items_addressed=0,
+        )
+
+    total_score = sum(c["score"] for c in candidates)
+
+    recommendations = []
+    for c in candidates:
+        item = c["item"]
+        budget_share = (c["score"] / total_score) * budget
+        affordable_qty = int(budget_share // item["unit_cost"])
+        final_qty = min(c["recommended_qty"], affordable_qty)
+
+        if final_qty == 0:
+            continue
+
+        estimated_cost = round(final_qty * item["unit_cost"], 2)
+        score = round(c["score"], 4)
+        if score >= 0.5:
+            priority = "high"
+        elif score >= 0.2:
+            priority = "medium"
+        else:
+            priority = "low"
+
+        recommendations.append(RestockingRecommendation(
+            id=item["id"],
+            sku=item["sku"],
+            name=item["name"],
+            category=item["category"],
+            warehouse=item["warehouse"],
+            quantity_on_hand=item["quantity_on_hand"],
+            reorder_point=item["reorder_point"],
+            recommended_qty=final_qty,
+            unit_cost=item["unit_cost"],
+            estimated_cost=estimated_cost,
+            score=score,
+            priority=priority,
+            trend=c["trend"],
+            forecasted_demand=c["forecasted_demand"],
+            current_demand=c["current_demand"],
+        ))
+
+    recommendations.sort(key=lambda r: r.score, reverse=True)
+    total_cost = round(sum(r.estimated_cost for r in recommendations), 2)
+
+    return RestockingResponse(
+        recommendations=recommendations,
+        total_estimated_cost=total_cost,
+        budget_remaining=round(budget - total_cost, 2),
+        items_addressed=len(recommendations),
+    )
+
 # API endpoints
 @app.get("/")
 def root():
@@ -303,6 +437,15 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restocking", response_model=RestockingResponse)
+def get_restocking_recommendations(
+    budget: float,
+    warehouse: Optional[str] = None,
+    category: Optional[str] = None,
+):
+    """Get demand-weighted restocking recommendations within a budget."""
+    return calculate_restocking(budget, warehouse, category)
 
 if __name__ == "__main__":
     import uvicorn
